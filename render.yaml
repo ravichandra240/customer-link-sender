@@ -17,6 +17,16 @@ services:
         value: "false"
       - key: WEBSITE_LINK
         value: https://eleganthome.co.in/contact-us/
+      - key: PUBLIC_BASE_URL
+        sync: false          # your Render address, e.g. https://customer-link-sender.onrender.com
+      - key: BUSINESS_NAME
+        value: Elegant Home
+      - key: CONTACT_PHONE
+        sync: false          # e.g. +919876543210
+      - key: CONTACT_WHATSAPP
+        sync: false
+      - key: CONTACT_EMAIL
+        sync: false
       - key: SECRET_KEY
         generateValue: true
       - key: APP_PASSWORD

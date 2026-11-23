@@ -17,6 +17,17 @@ python app.py
 ```
 Open http://localhost:5000. By default `DRY_RUN=true`, so messages are only printed in the terminal.
 
+## Customer service page
+Each saved customer gets a private link (`/c/<random code>`) inside their weekend message. On that page they can only:
+- send a **service request** (service type, message, best time to contact), and
+- see your **contact details** (call, WhatsApp, email).
+
+They cannot see other customers or your dashboard. Requests show up in your dashboard under **Service requests** (New / In progress / Done, plus a Reply on WhatsApp button).
+
+Settings: `PUBLIC_BASE_URL` (the address customers' links start with, e.g. `http://localhost:5000` locally or your hosted address), `BUSINESS_NAME`, `CONTACT_PHONE`, `CONTACT_WHATSAPP`, `CONTACT_EMAIL`. Each customer can send up to 5 requests per day.
+
+Important: set `PUBLIC_BASE_URL` to your real hosted address before sending real messages, or customers get a `localhost` link that will not open on their phones.
+
 ## Send real messages (Twilio)
 WhatsApp and SMS cannot be sent for free automatically; you need a provider. Twilio handles both:
 1. Create a Twilio account, get Account SID and Auth Token.
