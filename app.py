@@ -11,7 +11,9 @@ Requests appear in your dashboard under "Service requests".
 
 Run:  python app.py     then open http://localhost:5000
 """
+import csv
 import hmac
+import io
 import os
 import secrets
 import sqlite3
@@ -49,6 +51,7 @@ CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "")
 
 SERVICE_TYPES = ["General enquiry", "Repair", "Interior work", "Site visit", "Other"]
 MAX_REQUESTS_PER_DAY = 5
+MAX_SELF_SIGNUPS_PER_DAY = 100  # overall cap on new people via the public form
 
 # DRY_RUN=true  -> messages are only logged, nothing is really sent.
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
@@ -71,8 +74,8 @@ APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 
 @app.before_request
 def require_login():
-    """Owner pages need the password. Customer pages (/c/<token>...) are public."""
-    if request.path.startswith("/c/"):
+    """Owner pages need the password. Customer pages (/c/<token>..., /service) are public."""
+    if request.path.startswith("/c/") or request.path == "/service" or request.path.startswith("/service/"):
         return None
     if not APP_PASSWORD:
         return None
@@ -117,6 +120,13 @@ def init_db():
         for r in conn.execute("SELECT id FROM customers WHERE token IS NULL OR token=''").fetchall():
             conn.execute("UPDATE customers SET token=? WHERE id=?", (new_token(), r["id"]))
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_token ON customers(token)")
+        for col, ddl in (
+            ("source", "TEXT NOT NULL DEFAULT 'admin'"),
+            ("email", "TEXT"),
+            ("address", "TEXT"),
+        ):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE customers ADD COLUMN {col} {ddl}")
 
         conn.execute(
             """CREATE TABLE IF NOT EXISTS service_requests (
@@ -279,10 +289,17 @@ PAGE = """
   {% else %}<tr><td colspan="7">No service requests yet.</td></tr>{% endfor %}
 </table>
 
-<h2>Customers</h2>
+<div class="flash" style="background:#eef4ff">
+  <strong>Public link for anyone to request a service:</strong>
+  <a href="{{ service_url }}" target="_blank">{{ service_url }}</a><br>
+  <small>Share it on your website, WhatsApp or as a QR code. People who use it appear below as "Self-registered".</small>
+</div>
+<h2>Customers <a href="{{ url_for('export_csv') }}"><button class="small grey" type="button">Download customers (CSV)</button></a></h2>
 <form class="add" method="post" action="{{ url_for('add') }}">
   <input name="name" placeholder="Customer name" required>
   <input name="phone" placeholder="Mobile number" required>
+  <input name="email" placeholder="Email (optional)" type="email">
+  <input name="address" placeholder="Address / area (optional)">
   <select name="channel">
     <option value="whatsapp">WhatsApp</option>
     <option value="sms">SMS</option>
@@ -290,22 +307,29 @@ PAGE = """
   <button>Save customer</button>
 </form>
 <table>
-  <tr><th>Name</th><th>Phone</th><th>Via</th><th>Scheduled</th><th>Status</th><th></th></tr>
+  <tr><th>Name</th><th>Phone</th><th>Email / Address</th><th>Source</th><th>Via</th><th>Scheduled</th><th>Status</th><th></th></tr>
   {% for c in customers %}
   <tr>
-    <td>{{ c['name'] }}</td><td>{{ c['phone'] }}</td><td>{{ c['channel'] }}</td>
+    <td>{{ c['name'] }}</td><td>{{ c['phone'] }}</td>
+    <td>{{ c['email'] or '-' }}<br><small>{{ c['address'] or '' }}</small></td>
+    <td>{{ 'Self-registered' if c['source'] == 'self' else 'Added by you' }}</td>
+    {% if c['source'] == 'self' %}
+    <td>-</td><td>-</td><td>-</td>
+    {% else %}
+    <td>{{ c['channel'] }}</td>
     <td>{{ c['send_at'][:16].replace('T',' ') }}</td>
     <td class="{{ c['status'] }}">{{ c['status'] }}{% if c['error'] %}<br><small>{{ c['error'] }}</small>{% endif %}</td>
+    {% endif %}
     <td>
       <a href="{{ wa_link(c) }}" target="_blank"><button class="small grey" type="button">Open WhatsApp</button></a>
       <a href="{{ cust_link(c) }}" target="_blank"><button class="small grey" type="button">Customer page</button></a>
-      {% if c['status'] != 'sent' %}
+      {% if c['source'] != 'self' and c['status'] != 'sent' %}
       <form class="inline" method="post" action="{{ url_for('send_now', cid=c['id']) }}">
         <button class="small">Send now</button></form>
       {% endif %}
     </td>
   </tr>
-  {% else %}<tr><td colspan="6">No customers yet.</td></tr>{% endfor %}
+  {% else %}<tr><td colspan="8">No customers yet.</td></tr>{% endfor %}
 </table>
 """
 
@@ -399,6 +423,7 @@ def index():
     return render_template_string(
         PAGE, customers=customers, reqs=reqs, new_count=new_count, dry=DRY_RUN,
         wa_link=wa_link, reply_link=reply_link, cust_link=customer_link,
+        service_url=f"{PUBLIC_BASE_URL}/service",
     )
 
 
@@ -408,7 +433,8 @@ def add():
     send_at = next_send_time(now)
     with db() as conn:
         conn.execute(
-            "INSERT INTO customers (name, phone, channel, saved_at, send_at, token) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO customers (name, phone, channel, saved_at, send_at, token, email, address, source)"
+            " VALUES (?,?,?,?,?,?,?,?, 'admin')",
             (
                 request.form["name"].strip(),
                 normalize_phone(request.form["phone"]),
@@ -416,6 +442,8 @@ def add():
                 now.isoformat(timespec="seconds"),
                 send_at.isoformat(timespec="seconds"),
                 new_token(),
+                request.form.get("email", "").strip()[:200],
+                request.form.get("address", "").strip()[:300],
             ),
         )
     flash(f"Customer saved. Message will be sent on {send_at:%A, %d %b %Y %H:%M}.")
@@ -498,6 +526,179 @@ def customer_request(token):
         )
     flash("Thank you! Your request has been sent. We will contact you shortly.")
     return redirect(url_for("customer_page", token=token))
+
+
+# ---------------- Public "request a service" page (no link needed) ----------------
+SERVICE_PAGE = """
+<!doctype html>
+<title>Request a service - {{ business }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<style>
+  body{font-family:system-ui,sans-serif;max-width:560px;margin:0 auto;padding:20px 16px 40px;color:#222;background:#fafafa}
+  h1{font-size:22px;margin:8px 0 2px} .sub{color:#666;margin-top:0}
+  .card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin:16px 0}
+  label{display:block;font-weight:600;margin:12px 0 4px;font-size:14px}
+  input,select,textarea{width:100%;box-sizing:border-box;padding:11px;font-size:16px;border:1px solid #ccc;border-radius:8px;font-family:inherit}
+  textarea{min-height:100px}
+  button.go{margin-top:16px;width:100%;padding:13px;font-size:16px;background:#1a73e8;color:#fff;border:none;border-radius:8px;cursor:pointer}
+  .flash{background:#e6f4ea;padding:12px;border-radius:8px;margin:12px 0}
+  .err{background:#fde8e8}
+  .contact a{display:block;padding:12px;margin:8px 0;border-radius:8px;text-align:center;text-decoration:none;font-weight:600;color:#fff;background:#1a73e8}
+  .contact a.wa{background:#15803d} .contact a.mail{background:#6b7280}
+  .hp{position:absolute;left:-5000px;height:0;overflow:hidden}
+</style>
+<h1>{{ business }}</h1>
+<p class="sub">Request a service and we will contact you.</p>
+{% with msgs = get_flashed_messages(with_categories=true) %}
+  {% for cat, m in msgs %}<div class="flash {{ 'err' if cat == 'error' else '' }}">{{ m }}</div>{% endfor %}
+{% endwith %}
+{% if thanks %}
+<div class="card"><strong>Thank you!</strong><br>Your request has been received. We will contact you shortly.</div>
+{% else %}
+<div class="card">
+  <form method="post" action="{{ url_for('service_submit') }}">
+    <label for="name">Your name</label>
+    <input id="name" name="name" maxlength="100" required>
+    <label for="phone">Mobile number</label>
+    <input id="phone" name="phone" type="tel" maxlength="20" required placeholder="e.g. 98765 43210">
+    <label for="email">Email (optional)</label>
+    <input id="email" name="email" type="email" maxlength="200">
+    <label for="address">Address / area (optional)</label>
+    <input id="address" name="address" maxlength="300">
+    <label for="service_type">Service</label>
+    <select id="service_type" name="service_type" required>
+      {% for s in services %}<option>{{ s }}</option>{% endfor %}
+    </select>
+    <label for="message">What do you need?</label>
+    <textarea id="message" name="message" maxlength="1000" required></textarea>
+    <label for="preferred_time">Best time to contact you (optional)</label>
+    <input id="preferred_time" name="preferred_time" maxlength="100" placeholder="e.g. Tomorrow after 5 pm">
+    <div class="hp" aria-hidden="true"><label>Leave empty<input name="website" tabindex="-1" autocomplete="off"></label></div>
+    <button class="go">Send request</button>
+  </form>
+</div>
+{% endif %}
+{% if phone or whatsapp or email %}
+<div class="card contact">
+  <strong>Or contact us directly</strong>
+  {% if phone %}<a href="tel:{{ phone }}">Call {{ phone }}</a>{% endif %}
+  {% if whatsapp %}<a class="wa" href="https://wa.me/{{ whatsapp.lstrip('+') }}">Chat on WhatsApp</a>{% endif %}
+  {% if email %}<a class="mail" href="mailto:{{ email }}">Email {{ email }}</a>{% endif %}
+</div>
+{% endif %}
+"""
+
+
+def render_service_page(thanks=False):
+    resp = Response(
+        render_template_string(
+            SERVICE_PAGE, thanks=thanks, services=SERVICE_TYPES, business=BUSINESS_NAME,
+            phone=CONTACT_PHONE, whatsapp=CONTACT_WHATSAPP, email=CONTACT_EMAIL,
+        )
+    )
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    return resp
+
+
+@app.route("/service")
+def service_page():
+    return render_service_page()
+
+
+@app.route("/service/thanks")
+def service_thanks():
+    return render_service_page(thanks=True)
+
+
+@app.route("/service", methods=["POST"])
+def service_submit():
+    # Hidden field: real people leave it empty, bots fill it. Pretend success.
+    if request.form.get("website"):
+        return redirect(url_for("service_thanks"))
+
+    name = request.form.get("name", "").strip()[:100]
+    digits = "".join(ch for ch in request.form.get("phone", "") if ch.isdigit())
+    service_type = request.form.get("service_type", "")
+    message = request.form.get("message", "").strip()[:1000]
+    if not name or not (8 <= len(digits) <= 15) or service_type not in SERVICE_TYPES or not message:
+        flash("Please enter your name, a valid mobile number, a service and a message.", "error")
+        return render_service_page()
+    phone = normalize_phone(request.form.get("phone", ""))
+    email = request.form.get("email", "").strip()[:200]
+    address = request.form.get("address", "").strip()[:300]
+    preferred = request.form.get("preferred_time", "").strip()[:100]
+
+    now = datetime.now(TIMEZONE)
+    now_s = now.isoformat(timespec="seconds")
+    since = (now - timedelta(days=1)).isoformat(timespec="seconds")
+    with db() as conn:
+        c = conn.execute("SELECT * FROM customers WHERE phone=?", (phone,)).fetchone()
+        if c:
+            recent = conn.execute(
+                "SELECT COUNT(*) FROM service_requests WHERE customer_id=? AND created_at>=?",
+                (c["id"], since),
+            ).fetchone()[0]
+            if recent >= MAX_REQUESTS_PER_DAY:
+                return redirect(url_for("service_thanks"))
+            # Fill in details they did not have before; never overwrite what you saved.
+            conn.execute(
+                "UPDATE customers SET email=CASE WHEN COALESCE(email,'')='' THEN ? ELSE email END,"
+                " address=CASE WHEN COALESCE(address,'')='' THEN ? ELSE address END WHERE id=?",
+                (email, address, c["id"]),
+            )
+            cid = c["id"]
+        else:
+            signups = conn.execute(
+                "SELECT COUNT(*) FROM customers WHERE source='self' AND saved_at>=?", (since,)
+            ).fetchone()[0]
+            if signups >= MAX_SELF_SIGNUPS_PER_DAY:
+                flash("We are receiving many requests right now. Please call us instead.", "error")
+                return render_service_page()
+            cur = conn.execute(
+                "INSERT INTO customers (name, phone, channel, saved_at, send_at, status, token,"
+                " email, address, source) VALUES (?,?,?,?,?,?,?,?,?, 'self')",
+                (name, phone, "whatsapp", now_s, now_s, "self", new_token(), email, address),
+            )
+            cid = cur.lastrowid
+        conn.execute(
+            "INSERT INTO service_requests (customer_id, service_type, message, preferred_time, created_at)"
+            " VALUES (?,?,?,?,?)",
+            (cid, service_type, message, preferred, now_s),
+        )
+    return redirect(url_for("service_thanks"))
+
+
+def _csv_safe(value):
+    """Stop spreadsheet formula injection from text people typed."""
+    value = "" if value is None else str(value)
+    return "'" + value if value[:1] in ("=", "+", "-", "@", "\t", "\r") else value
+
+
+@app.route("/export.csv")
+def export_csv():
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM customers ORDER BY id").fetchall()
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["Name", "Phone", "Email", "Address", "Source", "Saved at", "Requests"])
+    with db() as conn:
+        for r in rows:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM service_requests WHERE customer_id=?", (r["id"],)
+            ).fetchone()[0]
+            w.writerow([
+                _csv_safe(r["name"]), r["phone"], _csv_safe(r["email"]), _csv_safe(r["address"]),
+                "Self-registered" if r["source"] == "self" else "Added by you",
+                r["saved_at"][:16].replace("T", " "), n,
+            ])
+    # utf-8 with BOM so Excel shows names correctly
+    data = "﻿" + out.getvalue()
+    return Response(
+        data, mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=customers.csv"},
+    )
 
 
 init_db()

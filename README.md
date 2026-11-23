@@ -28,6 +28,15 @@ Settings: `PUBLIC_BASE_URL` (the address customers' links start with, e.g. `http
 
 Important: set `PUBLIC_BASE_URL` to your real hosted address before sending real messages, or customers get a `localhost` link that will not open on their phones.
 
+## Public "request a service" page (no link needed)
+Anyone can open `/service` (for example `https://your-app/service`) and request a service without being added by you first. It collects name, mobile, email, address/area, service type, message and best time. They appear in your dashboard as **Self-registered**, and their request shows under **Service requests**. If the mobile number already exists, the request is added to that customer instead of creating a duplicate. Self-registered people do not get the weekend message.
+
+Share the `/service` link on your website, WhatsApp status or as a QR code. The dashboard shows it near the top.
+
+Your dashboard shows each customer's email, address and source, and the **Download customers (CSV)** button exports everything to Excel.
+
+Spam protection: a hidden form field catches bots, each phone number can send 5 requests a day, and at most 100 new people can register per day.
+
 ## Send real messages (Twilio)
 WhatsApp and SMS cannot be sent for free automatically; you need a provider. Twilio handles both:
 1. Create a Twilio account, get Account SID and Auth Token.
